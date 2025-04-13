@@ -26,10 +26,10 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
-try:
-    import comet_ml  # must be imported before torch (if installed)
-except ImportError:
-    comet_ml = None
+# try:
+#     import comet_ml  # must be imported before torch (if installed)
+# except ImportError:
+comet_ml = None
 
 import numpy as np
 import torch
@@ -135,8 +135,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-    # amp = check_amp(model)  # check AMP
-    amp = False  # comment out for erratic training results
+    amp = check_amp(model)  # check AMP
+    # amp = False  # comment out for erratic training results
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
@@ -331,8 +331,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
+                # if ema:
+                #     ema.update(model)
                 last_opt_step = ni
 
             # Log
@@ -360,7 +360,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                 batch_size=batch_size // WORLD_SIZE * 2,
                                                 imgsz=imgsz,
                                                 half=amp,
-                                                model=ema.ema,
+                                                model=deepcopy(de_parallel(model)).eval() ,
                                                 single_cls=single_cls,
                                                 dataloader=val_loader,
                                                 save_dir=save_dir,
@@ -382,7 +382,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     'epoch': epoch,
                     'best_fitness': best_fitness,
                     'model': deepcopy(de_parallel(model)).half(),
-                    'ema': deepcopy(ema.ema).half(),
+                    # 'ema': deepcopy(ema.ema).half(),
                     'updates': ema.updates,
                     'optimizer': optimizer.state_dict(),
                     'opt': vars(opt),

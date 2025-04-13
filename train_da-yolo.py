@@ -86,8 +86,8 @@ torch.set_num_threads(N_THREADS_TORCH)
 
         
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
-        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
+    save_dir, epochs, batch_size, weights, single_cls, evolve, data, data_source, cfg, resume, noval, nosave, workers, freeze = \
+        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.data_source, opt.cfg, \
         opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
     
     # Hyperparameters
@@ -138,7 +138,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     init_seeds(opt.seed + 1 + RANK, deterministic=True)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
+        data_dict_source = check_dataset(data_source)
     train_path, val_path = data_dict['train'], data_dict['val']
+    train_path_source, val_path_source = data_dict_source['train'], data_dict_source['val']
+
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = {0: 'item'} if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
@@ -161,8 +164,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     else:
         model_student = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create the student model
         model_teacher = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create the teacher model
-    # amp = check_amp(model_student)  # check AMP
-    amp = False
+    amp = check_amp(model_student)  # check AMP
+    # amp = False
 
     # Freeze
     freeze_student = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
@@ -204,9 +207,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 param.requires_grad = set_requires_grad
         return params
 
-    student_detection_params = get_params(model_student)
-    teacher_detection_params = get_params(model_teacher, set_requires_grad=False)
-    optimizer_teacher = WeightEMA(teacher_detection_params, student_detection_params, alpha=teacher_alpha)
+    # student_detection_params = get_params(model_student)
+    # teacher_detection_params = get_params(model_teacher, set_requires_grad=False)
+    # optimizer_teacher = WeightEMA(teacher_detection_params, student_detection_params, alpha=teacher_alpha)
 
     if opt.cos_lr:
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
@@ -222,14 +225,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         scheduler = lr_scheduler.LambdaLR(optimizer_student, lr_lambda=lf)  
 
     # EMA
-    ema = ModelEMA(model_student) if RANK in {-1, 0} else None
+    # ema = ModelEMA(model_student) if RANK in {-1, 0} else None
 
     # Resume
-    best_fitness, start_epoch = 0.0, 0
-    if pretrained:
-        if resume:
-            best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer_student, ema, weights, epochs, resume)
-        del ckpt, csd
+    best_fitness, best_fitness_s, start_epoch = 0.0, 0.0, 0
+    # if pretrained:
+    #     if resume:
+    #         best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer_student, ema, weights, epochs, resume)
+    #     del ckpt, csd
 
     # DP mode
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
@@ -263,6 +266,26 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               prefix=colorstr('train: '),
                                               shuffle=True,
                                               seed=opt.seed)
+
+    # Trainloader for source dataset
+    train_loader_s, dataset_s = create_dataloader(train_path_source,
+                                              imgsz,
+                                              batch_size // WORLD_SIZE,
+                                              gs,
+                                              single_cls,
+                                              hyp=hyp,
+                                              augment=True,
+                                              cache=None if opt.cache == 'val' else opt.cache,
+                                              rect=opt.rect,
+                                              rank=LOCAL_RANK,
+                                              workers=workers,
+                                              image_weights=opt.image_weights,
+                                              quad=opt.quad,
+                                              prefix=colorstr('train: '),
+                                              shuffle=True,
+                                              seed=opt.seed+3)
+
+
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
@@ -319,6 +342,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
@@ -326,9 +350,27 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     callbacks.run('on_train_start')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
+                f'Using {train_loader_s.num_workers * WORLD_SIZE} dataloader_source workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
                 # if ni % (nb // 4) == 0 and ni!=nb:
+
+    if RANK in {-1, 0}:
+        print("source-only eval......")
+        results, _, _ = validate.run(
+                            data_dict,
+                            batch_size=batch_size // WORLD_SIZE * 2,
+                            imgsz=imgsz,
+                            model=model_teacher,
+                            iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
+                            single_cls=single_cls,
+                            dataloader=val_loader,
+                            save_dir=save_dir,
+                            save_json=is_coco,
+                            verbose=True,
+                            plots=plots,
+                            callbacks=callbacks,
+                            compute_loss=compute_loss)  # val best model with plots
     
     adain = enhance_vgg16(opt)
     
@@ -350,8 +392,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # mloss = torch.zeros(4, device=device)  # mean losses
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
+            train_loader_s.sampler.set_epoch(epoch)
+        pbar_t = iter(train_loader)    
+        pbar_s = iter(train_loader_s)
+        # iter_nums = min(len(train_loader), len(train_loader_s))
         pbar = enumerate(train_loader)
-        # LOGGER.info(('\n' + '%11s' * 8) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'gw_g_loss','Instances', 'Size'))
         LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'Instances', 'Size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
@@ -368,15 +413,20 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     if name in teacher_state_dict:
                         param.data.copy_((1.0 - SSM_alpha) * param.data + SSM_alpha * teacher_state_dict[name].data)
                 LOGGER.info(f'Transferred teacher weights to student model at the start of epoch {epoch}, alpha={SSM_alpha}')
-            
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+
+        imgs, targets, paths, _ = next(pbar_t)  # load source data for the first time
+        imgs_s, targets_s, paths_s, _ = next(pbar_s)  # load source data for the first time
+        model_student.zero_grad()
+        for i, (_, _, _, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
             opt.imgs_paths = paths # path for target augment module
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs_255 = imgs.clone().to(torch.float32).to(device, non_blocking=True) 
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            imgs_255 = imgs.clone().to(torch.float32).to(device, non_blocking=True)
 
-            # Warmup
+            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            imgs_s = imgs_s.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+
+            # Warmup (no use)
             if ni <= nw:
                 xi = [0, nw]  # x interp
                 # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
@@ -394,19 +444,21 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+                    imgs_s = nn.functional.interpolate(imgs_s, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
             with torch.amp.autocast("cuda", enabled=amp):
                 imgs_style = get_style_images(imgs_255, opt, adain) / 255
                     
                 # Teacher forward 
-                model_teacher.eval()
-                pred_teacher, _ = model_teacher(imgs)  # inference on teacher to obtain pseudo labels
-                pred_teacher_nms = non_max_suppression(pred_teacher, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=True, agnostic=single_cls, max_det=max_gt_boxes)
+                with torch.no_grad():
+                    model_teacher.eval()
+                    pred_teacher, _ = model_teacher(imgs)  # inference on teacher to obtain pseudo labels
+                    pred_teacher_nms = non_max_suppression(pred_teacher, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=True, agnostic=single_cls, max_det=max_gt_boxes)
                             
                 # Student forward
-                model_student.zero_grad()
                 pred_student = model_student(imgs_style)  # forward
+                pred_student_s = model_student(imgs_s) 
                     
                 # Generate pseudo labels using the teacher's prediction in order to obtain student loss
                 batch_size, ch, img_height, img_width = imgs.shape
@@ -431,7 +483,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     
                 # Compute loss using teacher's prediction as pseudo labels
                 loss, loss_items = compute_loss(pred_student, pseudo_labels_final.to(device), model_teacher, model_student)  # loss 
+                loss_s, loss_items_s = compute_loss(pred_student_s, targets_s.to(device), model_teacher, model_student)  # loss 
                 
+                loss = loss*0.3 + loss_s*0.7  # add source loss to student loss
+                loss_items = loss_items + loss_items_s  # add source loss to student loss items
+
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -447,26 +503,43 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 scaler.step(optimizer_student)  # optimizer.step
                 scaler.update()
                 optimizer_student.zero_grad()
-                if ema:
-                    ema.update(model_student)
+                # if ema:
+                #     ema.update(model_student) # close student ema update
                 last_opt_step = ni
 
-                model_teacher.train()
-                model_teacher.zero_grad()
-                optimizer_teacher.step()
+            with torch.no_grad():
+                # Get student and teacher state_dicts
+                student_state_dict = model_student.state_dict()
+                teacher_state_dict = model_teacher.state_dict()
+
+                # Update student weights with EMA of teacher weights
+                for name, param in teacher_state_dict.items():
+                    if name in student_state_dict:
+                        param.data.copy_(teacher_alpha * param.data + (1.0 - teacher_alpha) * student_state_dict[name].data)
 
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                # pbar.set_description(('%11s' * 2 + '%11.4g' * 6) %
-                #                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
                 pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
                 # Plot                   
                 callbacks.run('on_train_batch_end', model_student, ni, imgs, targets, paths, list(mloss), epoch, pseudo_labels_final, names, pbar)
                 if callbacks.stop_training:
                     return
+            
+            try:
+                imgs, targets, paths, _ = next(pbar_t)
+            except :
+                pbar_t = iter(train_loader)
+                imgs, targets, paths, _ = next(pbar_t)
+
+            try:
+                imgs_s, targets_s, paths_s, _ = next(pbar_s)
+            except :
+                pbar_s = iter(train_loader_s)
+                imgs_s, targets_s, paths_s, _ = next(pbar_s)
+
 
         # Scheduler
         lr = [x['lr'] for x in optimizer_student.param_groups]  # for loggers
@@ -475,9 +548,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK in {-1, 0}:
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
-            ema.update_attr(model_student, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+            # ema.update_attr(model_student, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
+                print("teacher eval......")
                 results, maps, _ = validate.run(data_dict,
                                                 batch_size=batch_size // WORLD_SIZE * 2,
                                                 imgsz=imgsz,
@@ -490,8 +564,25 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                 callbacks=callbacks,
                                                 compute_loss=compute_loss,
                                                 verbose=False)
+                print("student eval......")
+                results_s, maps, _ = validate.run(data_dict,
+                                                batch_size=batch_size // WORLD_SIZE * 2,
+                                                imgsz=imgsz,
+                                                half=amp,
+                                                model=deepcopy(de_parallel(model_student)).eval(),  # use EMA model for inference
+                                                single_cls=single_cls,
+                                                dataloader=val_loader,
+                                                save_dir=save_dir,
+                                                plots=False,
+                                                callbacks=callbacks,
+                                                compute_loss=compute_loss,
+                                                verbose=False)
 
             # Update best mAP
+            fi_s = fitness(np.array(results_s).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            if fi_s > best_fitness_s:
+                best_fitness_s = fi_s
+
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             stop = stopper(epoch=epoch, fitness=fi)  # early stop check
             if fi > best_fitness:
@@ -505,8 +596,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     'epoch': epoch,
                     'best_fitness': best_fitness,
                     'model': deepcopy(de_parallel(model_student)).half(),
-                    'ema': deepcopy(ema.ema).half(),
-                    'updates': ema.updates,
+                    # 'ema': deepcopy(ema.ema).half(),
+                    # 'updates': ema.updates,
                     'optimizer': optimizer_student.state_dict(),
                     'opt': vars(opt),
                     'git': GIT_INFO,  # {remote, branch, commit} if a git repo
@@ -526,6 +617,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     torch.save(ckpt_teacher, best_teacher)
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt_teacher, w / f'epoch{epoch}_teacher.pt')
+
+                torch.save(ckpt_student, last_student)
+                if best_fitness_s == fi_s:
+                    torch.save(ckpt_student, best_student)
+                if opt.save_period > 0 and epoch % opt.save_period == 0:
+                    torch.save(ckpt_student, w / f'epoch{epoch}_student.pt')
                 del ckpt_student, ckpt_teacher
                 callbacks.run('on_model_save', last_teacher, epoch, final_epoch, best_fitness, fi)
 
@@ -539,7 +636,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             break  # must break all DDP ranks
 
         # end epoch ----------------------------------------------------------------------------------------------------
-        # optimizer_teacher.step() 
+       
     # end training -----------------------------------------------------------------------------------------------------
     if RANK in {-1, 0}:
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
@@ -577,6 +674,7 @@ def parse_opt(known=False):
     parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
+    parser.add_argument('--data_source', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
@@ -610,10 +708,10 @@ def parse_opt(known=False):
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--seed', type=int, default=0, help='Global training seed')
     parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
-    parser.add_argument('--conf_thres', type=float, default=0.4, help='Confidence threshold for pseudo labels generation by the teacher model')
-    parser.add_argument('--iou_thres', type=float, default=0.3, help='IoU threshold for pseudo labels NMS by the teacher model')
-    parser.add_argument('--max_gt_boxes', type=int, default=20, help='Maximum number of ground truth boxes for pseudo labels generation by the teacher model')
-    parser.add_argument('--teacher_alpha', type=float, default=0.999, help='Teacher alpha for MT EMA')
+    parser.add_argument('--conf_thres', type=float, default=0.25, help='Confidence threshold for pseudo labels generation by the teacher model')
+    parser.add_argument('--iou_thres', type=float, default=0.45, help='IoU threshold for pseudo labels NMS by the teacher model')
+    parser.add_argument('--max_gt_boxes', type=int, default=100, help='Maximum number of ground truth boxes for pseudo labels generation by the teacher model')
+    parser.add_argument('--teacher_alpha', type=float, default=0.9996, help='Teacher alpha for MT EMA')
     parser.add_argument('--plot_save_interval', type=int, default=100, help='Interval of epoch to save plots (useful to debug)')
 
     # Logger arguments
@@ -656,8 +754,8 @@ def main(opt, callbacks=Callbacks()):
         if is_url(opt_data):
             opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
     else:
-        opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = \
-            check_file(opt.data), check_yaml(opt.cfg), check_yaml(opt.hyp), str(opt.weights), str(opt.project)  # checks
+        opt.data, opt.data_source, opt.cfg, opt.hyp, opt.weights, opt.project = \
+            check_file(opt.data), check_file(opt.data_source), check_yaml(opt.cfg), check_yaml(opt.hyp), str(opt.weights), str(opt.project)  # checks
         assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
         if opt.evolve:
             if opt.project == str(ROOT / 'runs/train'):  # if default project name, rename to runs/evolve
@@ -797,4 +895,3 @@ def run(**kwargs):
 if __name__ == '__main__':
     opt = parse_opt()
     main(opt)
-

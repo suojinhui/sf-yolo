@@ -32,11 +32,19 @@ python train.py --scenario_name city2foggy --content_dir data/city2foggy --style
 Download the [Cityscapes source model weights](https://drive.proton.me/urls/3VEG0P1GQR#MAfSdjS57GHI) and place them in the `./source_weights` folder, then run:
 
 ```
-python train_source.py --epochs 10 --batch-size 2 --data cityscapes.yaml --weights ./source_weights/yolov5l.pt --imgsz 960 --device 0 
+python train_source.py --epochs 5 --batch-size 2 --data cityscapes.yaml --weights ./source_weights/yolov5l.pt --imgsz 960 --device 0 --name source_only
 ```
 
 ```
-python train_sf-yolo.py --epochs 60 --batch-size 16 --data foggy_cityscapes.yaml --weights ./source_weights/yolov5l_cityscapes.pt --decoder_path TargetAugment_train/models/city2foggy/decoder_iter_160000.pth --encoder_path TargetAugment_train/pre_trained/vgg16_ori.pth --fc1 TargetAugment_train/models/city2foggy/fc1_iter_160000.pth --fc2 TargetAugment_train/models/city2foggy/fc2_iter_160000.pth --style_add_alpha 0.4 --style_path ./TargetAugment_train/data/meanfoggy/meanfoggy.jpg --SSM_alpha 0.5 --device 0 
+python val.py --weights ./runs/train/exp5/weights/best.pt --data foggy_cityscapes.yaml --img 960 
+```
+
+```
+python train_sf-yolo.py --epochs 10 --batch-size 2 --data foggy_cityscapes.yaml --weights ./runs/train/exp5/weights/best.pt --decoder_path TargetAugment_train/models/city2foggy/decoder_iter_10000.pth --encoder_path TargetAugment_train/pre_trained/vgg16_ori.pth --fc1 TargetAugment_train/models/city2foggy/fc1_iter_10000.pth --fc2 TargetAugment_train/models/city2foggy/fc2_iter_10000.pth --style_add_alpha 0.4 --style_path ./TargetAugment_train/data/meanfoggy/meanfoggy.jpg --SSM_alpha 0.5 --device 0 
+```
+
+```
+python train_da-yolo.py --epochs 10 --batch-size 2 --data foggy_cityscapes.yaml --data_source cityscapes.yaml --weights ./runs/train/exp5/weights/best.pt --decoder_path TargetAugment_train/models/city2foggy/decoder_iter_10000.pth --encoder_path TargetAugment_train/pre_trained/vgg16_ori.pth --fc1 TargetAugment_train/models/city2foggy/fc1_iter_10000.pth --fc2 TargetAugment_train/models/city2foggy/fc2_iter_10000.pth --style_add_alpha 0.4 --style_path ./TargetAugment_train/data/meanfoggy/meanfoggy.jpg --SSM_alpha 0.5 --device 0 
 ```
 
 Other scenarios can be run by following the same steps. All source model weights are available [here](https://drive.proton.me/urls/5WFVDJBDAC#EPs8OZmXtbWq).

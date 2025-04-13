@@ -46,4 +46,4 @@ seaborn>=0.11.0
 # albumentations>=1.0.3
 # pycocotools>=2.0  # COCO mAP
 # roboflow
-# ultralytics  # HUB https://hub.ultralytics.com
+ultralytics  # HUB https://hub.ultralytics.com
