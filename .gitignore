@@ -172,3 +172,4 @@ source_weights/*
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 TargetAugment_train/data/city2foggy/
+test_images/

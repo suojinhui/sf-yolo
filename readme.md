@@ -68,6 +68,11 @@ python val.py --weights <your_weights_dir> --data foggy_cityscapes.yaml --img 96
 
 Other scenarios can be run by following the same steps. All source model weights are available [here](https://drive.proton.me/urls/5WFVDJBDAC#EPs8OZmXtbWq).
 
+### Detection
+
+```bash
+python detect.py --weights <your_weights_dir> --source <your_data_dir> --device 0 --imgsz 960
+```
 
 ### Acknowledgment
 
